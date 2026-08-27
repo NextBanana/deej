@@ -69,6 +69,15 @@ type OSDConfig struct {
 	// DimInactive greys out rows whose target application isn't running
 	DimInactive bool
 
+	// Monitors decides where the overlay appears: "all" puts a panel on every
+	// attached monitor, "primary" restricts it to the primary one
+	Monitors string
+
+	// SkipInExclusiveFullscreen drops overlay rows while a direct3d application owns
+	// the display. Forcing a topmost window at that moment can make the application
+	// flip out of fullscreen, and it wouldn't become visible either way
+	SkipInExclusiveFullscreen bool
+
 	// SuppressStartupMS silences the overlay right after startup and after a config
 	// reload, both of which emit a move event for every slider at once
 	SuppressStartupMS int
@@ -101,6 +110,8 @@ const (
 	configKeyOSDShowPercentage    = "osd.show_percentage"
 	configKeyOSDDimInactive       = "osd.dim_inactive"
 	configKeyOSDSuppressStartupMS = "osd.suppress_startup_ms"
+	configKeyOSDSkipFullscreen    = "osd.skip_in_exclusive_fullscreen"
+	configKeyOSDMonitors          = "osd.monitors"
 
 	defaultCOMPort  = "COM4"
 	defaultBaudRate = 9600
@@ -111,6 +122,7 @@ const (
 	defaultOSDFadeMS            = 200
 	defaultOSDScale             = 1.0
 	defaultOSDSuppressStartupMS = 1500
+	defaultOSDMonitors          = "all"
 )
 
 // has to be defined as a non-constant because we're using path.Join
@@ -155,6 +167,8 @@ func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, 
 	userConfig.SetDefault(configKeyOSDShowPercentage, true)
 	userConfig.SetDefault(configKeyOSDDimInactive, true)
 	userConfig.SetDefault(configKeyOSDSuppressStartupMS, defaultOSDSuppressStartupMS)
+	userConfig.SetDefault(configKeyOSDSkipFullscreen, false)
+	userConfig.SetDefault(configKeyOSDMonitors, defaultOSDMonitors)
 
 	internalConfig := viper.New()
 	internalConfig.SetConfigName(internalConfigName)
@@ -317,6 +331,9 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 		ShowPercentage:    cc.userConfig.GetBool(configKeyOSDShowPercentage),
 		DimInactive:       cc.userConfig.GetBool(configKeyOSDDimInactive),
 		SuppressStartupMS: cc.userConfig.GetInt(configKeyOSDSuppressStartupMS),
+
+		SkipInExclusiveFullscreen: cc.userConfig.GetBool(configKeyOSDSkipFullscreen),
+		Monitors:                  strings.ToLower(cc.userConfig.GetString(configKeyOSDMonitors)),
 	}
 
 	// guard against values that would make the overlay invisible or never disappear

@@ -5,6 +5,7 @@ import (
 	"math"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -15,25 +16,27 @@ import (
 	"go.uber.org/zap"
 )
 
-// win32 bits that lxn/win doesn't expose, bound lazily. user32 and gdi32 are
-// already loaded into every GUI process, so this doesn't cost a real load
+// win32 bits that lxn/win doesn't expose, bound lazily. user32, gdi32 and shell32
+// are already loaded into every GUI process, so this doesn't cost a real load
 var (
-	osdUser32 = syscall.NewLazyDLL("user32.dll")
-	osdGdi32  = syscall.NewLazyDLL("gdi32.dll")
+	osdUser32  = syscall.NewLazyDLL("user32.dll")
+	osdGdi32   = syscall.NewLazyDLL("gdi32.dll")
+	osdShell32 = syscall.NewLazyDLL("shell32.dll")
 
 	procSetLayeredWindowAttributes = osdUser32.NewProc("SetLayeredWindowAttributes")
 	procSetWindowRgn               = osdUser32.NewProc("SetWindowRgn")
 	procFillRect                   = osdUser32.NewProc("FillRect")
+	procEnumDisplayMonitors        = osdUser32.NewProc("EnumDisplayMonitors")
 	procCreateSolidBrush           = osdGdi32.NewProc("CreateSolidBrush")
 	procCreateRoundRectRgn         = osdGdi32.NewProc("CreateRoundRectRgn")
+
+	procSHQueryUserNotificationState = osdShell32.NewProc("SHQueryUserNotificationState")
 )
 
 const (
-	osdClassName  = "DeejOSDWindow"
-	osdWindowName = "deej overlay"
+	osdClassName = "DeejOSDWindow"
 
-	// SPI_GETWORKAREA gives us the primary monitor's work area, which already
-	// excludes the taskbar - no monitor enumeration needed
+	// SPI_GETWORKAREA gives the primary monitor's work area, taskbar excluded
 	spiGetWorkArea = 0x0030
 	lwaAlpha       = 0x00000002
 
@@ -44,7 +47,15 @@ const (
 	osdTimerID       = 1
 	osdTimerInterval = 16 // ms, ~60fps while visible - the timer is killed when hidden
 
-	// layout, in logical pixels at 96 dpi. everything gets scaled from here
+	// a fullscreen foreground window can end up above topmost windows, so panels
+	// re-assert their z-order every so often while they're on screen
+	osdTopmostReassertTicks = 16
+
+	// QUNS_RUNNING_D3D_FULL_SCREEN - a direct3d application has taken exclusive
+	// control of a display. nothing drawn from outside that process reaches it
+	qunsRunningD3DFullScreen = 3
+
+	// layout, in logical pixels at 96 dpi. everything is scaled from here
 	osdWidth      = 320
 	osdPadding    = 14
 	osdRowHeight  = 46
@@ -66,45 +77,76 @@ var (
 	osdColorBarDim     = win.RGB(112, 112, 112)
 )
 
-// the window procedure is a package-level callback, so it needs a way back to
-// the instance. deej only ever creates one overlay, which makes this safe
-var activeOSD *windowsOSD
+// the window procedure is a package-level callback, so it needs a way back to the
+// instance. deej only ever creates one overlay, which makes this safe
+var activeOSD *WindowsOSD
 
 var osdWndProcCallback = syscall.NewCallback(osdWndProc)
+
+var osdEnumMonitorsCallback = syscall.NewCallback(osdEnumMonitorsProc)
+
+// collected during EnumDisplayMonitors, which calls back synchronously. only ever
+// touched from the ui thread, so it needs no locking
+var osdEnumMonitorsResult []win.RECT
 
 type osdEntryState struct {
 	entry     OSDEntry
 	expiresAt time.Time
 }
 
-// WindowsOSD renders the overlay as a click-through layered window
+// osdPanel is one monitor's copy of the overlay. Each has its own fonts because
+// monitors can run at different dpi, and the app manifest opts into per-monitor
+// dpi awareness - windows won't scale anything for us
+type osdPanel struct {
+	hwnd      win.HWND
+	work      win.RECT
+	scale     float64
+	fontLabel win.HFONT
+	fontValue win.HFONT
+}
+
+func (p *osdPanel) destroyFonts() {
+	if p.fontLabel != 0 {
+		win.DeleteObject(win.HGDIOBJ(p.fontLabel))
+		p.fontLabel = 0
+	}
+
+	if p.fontValue != 0 {
+		win.DeleteObject(win.HGDIOBJ(p.fontValue))
+		p.fontValue = 0
+	}
+}
+
+// WindowsOSD renders the overlay as click-through layered windows, one per monitor.
+// A hidden controller window owns the timer and receives cross-thread posts, which
+// keeps panels free to be destroyed and rebuilt when the monitor layout changes
 type WindowsOSD struct {
 	deej   *Deej
 	logger *zap.SugaredLogger
 
-	// guards entries, which is written from deej's goroutines and read by the ui thread
+	// guards entries, written from deej's goroutines and read by the ui thread
 	mutex   sync.Mutex
 	entries map[int]*osdEntryState
 
-	// stored separately so ShowEntry can post to it without touching the ui thread
-	hwnd atomic.Uintptr
+	// stable target for ShowEntry's posts, which come from other goroutines
+	controller atomic.Uintptr
 
 	// everything below is only ever touched on the ui thread
+	panels     map[win.HWND]*osdPanel
+	panelAreas []win.RECT
 	brushes    map[win.COLORREF]win.HBRUSH
-	fontLabel  win.HFONT
-	fontValue  win.HFONT
-	fontScale  float64
-	visible    bool
-	fadingOut  bool
-	alpha      float64
-	lastRows   int
+
+	visible      bool
+	fadingOut    bool
+	alpha        float64
+	lastRows     int
+	inFullscreen bool
+	tickCount    uint64
+
 	classAtom  win.ATOM
 	hInstance  win.HINSTANCE
 	classNameW *uint16
 }
-
-// alias so the rest of the package can stay platform-neutral
-type windowsOSD = WindowsOSD
 
 // newOSD creates the Windows overlay implementation
 func newOSD(deej *Deej, logger *zap.SugaredLogger) (OSD, error) {
@@ -114,6 +156,7 @@ func newOSD(deej *Deej, logger *zap.SugaredLogger) (OSD, error) {
 		deej:    deej,
 		logger:  logger,
 		entries: make(map[int]*osdEntryState),
+		panels:  make(map[win.HWND]*osdPanel),
 		brushes: make(map[win.COLORREF]win.HBRUSH),
 	}
 
@@ -122,7 +165,7 @@ func newOSD(deej *Deej, logger *zap.SugaredLogger) (OSD, error) {
 	return o, nil
 }
 
-// Start creates the overlay window on a dedicated thread and pumps its messages
+// Start creates the controller window on a dedicated thread and pumps its messages
 func (o *WindowsOSD) Start() error {
 	ready := make(chan error, 1)
 
@@ -146,26 +189,26 @@ func (o *WindowsOSD) ShowEntry(entry OSDEntry) {
 	}
 	o.mutex.Unlock()
 
-	if hwnd := win.HWND(o.hwnd.Load()); hwnd != 0 {
-		win.PostMessage(hwnd, wmOSDUpdate, 0, 0)
+	if controller := win.HWND(o.controller.Load()); controller != 0 {
+		win.PostMessage(controller, wmOSDUpdate, 0, 0)
 	}
 }
 
-// Stop asks the ui thread to destroy the window and exit its message loop
+// Stop asks the ui thread to tear everything down and exit its message loop
 func (o *WindowsOSD) Stop() {
-	if hwnd := win.HWND(o.hwnd.Load()); hwnd != 0 {
-		win.PostMessage(hwnd, wmOSDQuit, 0, 0)
+	if controller := win.HWND(o.controller.Load()); controller != 0 {
+		win.PostMessage(controller, wmOSDQuit, 0, 0)
 	}
 }
 
-// uiThread owns the window for its entire lifetime. win32 windows belong to the
+// uiThread owns every window for its entire lifetime. win32 windows belong to the
 // thread that created them, so this goroutine must stay pinned to one os thread
 func (o *WindowsOSD) uiThread(ready chan error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	if err := o.createWindow(); err != nil {
-		o.logger.Errorw("Failed to create overlay window", "error", err)
+	if err := o.createController(); err != nil {
+		o.logger.Errorw("Failed to create overlay controller window", "error", err)
 		ready <- err
 
 		return
@@ -184,17 +227,12 @@ func (o *WindowsOSD) uiThread(ready chan error) {
 	o.logger.Debug("Overlay message loop ended")
 }
 
-func (o *WindowsOSD) createWindow() error {
+func (o *WindowsOSD) createController() error {
 	activeOSD = o
 
 	className, err := syscall.UTF16PtrFromString(osdClassName)
 	if err != nil {
 		return fmt.Errorf("encode class name: %w", err)
-	}
-
-	windowName, err := syscall.UTF16PtrFromString(osdWindowName)
-	if err != nil {
-		return fmt.Errorf("encode window name: %w", err)
 	}
 
 	o.classNameW = className
@@ -212,23 +250,16 @@ func (o *WindowsOSD) createWindow() error {
 		return fmt.Errorf("register window class")
 	}
 
-	// WS_EX_TRANSPARENT makes it click-through, WS_EX_NOACTIVATE keeps it from ever
-	// stealing focus, WS_EX_TOOLWINDOW keeps it out of alt-tab and the taskbar
-	hwnd := win.CreateWindowEx(
-		win.WS_EX_LAYERED|win.WS_EX_TRANSPARENT|win.WS_EX_TOOLWINDOW|
-			win.WS_EX_NOACTIVATE|win.WS_EX_TOPMOST,
-		className,
-		windowName,
-		win.WS_POPUP,
-		0, 0, 1, 1,
-		0, 0, o.hInstance, nil)
+	// never shown - it exists purely to own the timer and receive posted messages
+	controller := win.CreateWindowEx(
+		0, className, className, win.WS_POPUP,
+		0, 0, 0, 0, 0, 0, o.hInstance, nil)
 
-	if hwnd == 0 {
-		return fmt.Errorf("create overlay window")
+	if controller == 0 {
+		return fmt.Errorf("create overlay controller window")
 	}
 
-	o.hwnd.Store(uintptr(hwnd))
-	setLayeredWindowAttributes(hwnd, 0, 0, lwaAlpha)
+	o.controller.Store(uintptr(controller))
 
 	return nil
 }
@@ -239,67 +270,109 @@ func osdWndProc(hwnd win.HWND, msg uint32, wParam uintptr, lParam uintptr) uintp
 		return win.DefWindowProc(hwnd, msg, wParam, lParam)
 	}
 
-	switch msg {
-	case win.WM_PAINT:
-		o.paint(hwnd)
-		return 0
+	if hwnd == win.HWND(o.controller.Load()) {
+		switch msg {
+		case wmOSDUpdate:
+			o.onUpdate()
+			return 0
 
-	case wmOSDUpdate:
-		o.onUpdate(hwnd)
-		return 0
+		case win.WM_TIMER:
+			o.onTick()
+			return 0
 
-	case win.WM_TIMER:
-		o.onTick(hwnd)
-		return 0
+		case wmOSDQuit:
+			o.destroyPanels()
+			win.DestroyWindow(hwnd)
+			return 0
 
-	case wmOSDQuit:
-		win.DestroyWindow(hwnd)
-		return 0
+		case win.WM_DESTROY:
+			win.PostQuitMessage(0)
+			return 0
+		}
 
-	case win.WM_DESTROY:
-		win.PostQuitMessage(0)
-		return 0
+		return win.DefWindowProc(hwnd, msg, wParam, lParam)
+	}
+
+	if msg == win.WM_PAINT {
+		if panel, ok := o.panels[hwnd]; ok {
+			o.paintPanel(panel)
+
+			return 0
+		}
 	}
 
 	return win.DefWindowProc(hwnd, msg, wParam, lParam)
 }
 
 // onUpdate runs when a new or refreshed row arrives
-func (o *WindowsOSD) onUpdate(hwnd win.HWND) {
+func (o *WindowsOSD) onUpdate() {
 	rows := o.rowCount()
 	if rows == 0 {
 		return
 	}
 
+	if o.checkExclusiveFullscreen() && o.deej.config.OSD.SkipInExclusiveFullscreen {
+
+		// drop the pending rows rather than keeping them - the panels stay hidden,
+		// so their timer never runs and nothing would ever expire them
+		o.mutex.Lock()
+		o.entries = make(map[int]*osdEntryState)
+		o.mutex.Unlock()
+
+		return
+	}
+
+	o.ensurePanels()
+
+	if len(o.panels) == 0 {
+		return
+	}
+
 	o.fadingOut = false
-	o.relayout(hwnd, rows)
+	o.relayoutPanels(rows)
 
 	if !o.visible {
 		o.visible = true
 		o.alpha = 0
-		win.ShowWindow(hwnd, win.SW_SHOWNOACTIVATE)
-		win.SetTimer(hwnd, osdTimerID, osdTimerInterval, 0)
+
+		for _, panel := range o.panels {
+			win.ShowWindow(panel.hwnd, win.SW_SHOWNOACTIVATE)
+		}
+
+		win.SetTimer(win.HWND(o.controller.Load()), osdTimerID, osdTimerInterval, 0)
 	}
 
-	o.applyAlpha(hwnd)
-	win.InvalidateRect(hwnd, nil, false)
+	o.applyAlpha()
+	o.invalidatePanels()
 }
 
 // onTick expires rows one by one and drives the fade
-func (o *WindowsOSD) onTick(hwnd win.HWND) {
+func (o *WindowsOSD) onTick() {
+	o.tickCount++
+
+	// applications going fullscreen can push themselves above the topmost band.
+	// claiming it back periodically keeps panels visible over borderless fullscreen
+	if o.visible && o.tickCount%osdTopmostReassertTicks == 0 {
+		for _, panel := range o.panels {
+			win.SetWindowPos(panel.hwnd, win.HWND_TOPMOST, 0, 0, 0, 0,
+				win.SWP_NOACTIVATE|win.SWP_NOMOVE|win.SWP_NOSIZE)
+		}
+	}
+
 	rows := o.expireEntries()
 
 	if rows == 0 {
 		o.fadingOut = true
 	} else if rows != o.lastRows {
 
-		// a row dropped off while others remain - the panel has to shrink
-		o.relayout(hwnd, rows)
-		win.InvalidateRect(hwnd, nil, false)
+		// a row dropped off while others remain - the panels have to shrink
+		o.relayoutPanels(rows)
+		o.invalidatePanels()
 	}
 
 	fadeMS := o.deej.config.OSD.FadeMS
 	step := 255.0
+
 	if fadeMS > 0 {
 		step = 255.0 * float64(osdTimerInterval) / float64(fadeMS)
 	}
@@ -318,8 +391,12 @@ func (o *WindowsOSD) onTick(hwnd win.HWND) {
 		o.alpha = 0
 
 		if o.fadingOut {
-			win.KillTimer(hwnd, osdTimerID)
-			win.ShowWindow(hwnd, win.SW_HIDE)
+			win.KillTimer(win.HWND(o.controller.Load()), osdTimerID)
+
+			for _, panel := range o.panels {
+				win.ShowWindow(panel.hwnd, win.SW_HIDE)
+			}
+
 			o.visible = false
 			o.lastRows = 0
 
@@ -327,24 +404,108 @@ func (o *WindowsOSD) onTick(hwnd win.HWND) {
 		}
 	}
 
-	o.applyAlpha(hwnd)
+	o.applyAlpha()
 }
 
-// relayout resizes and repositions the panel for the given number of rows.
-// the panel is anchored to its configured edge, so with a bottom position it
-// grows upwards and the bottom row stays put
-func (o *WindowsOSD) relayout(hwnd win.HWND, rows int) {
-	scale := o.scale(hwnd)
-	o.ensureFonts(scale)
+// ensurePanels syncs the set of panels with the monitors currently attached. It's
+// called on every update, which is cheap and means display changes, resolution
+// switches and monitors being turned off need no separate handling
+func (o *WindowsOSD) ensurePanels() {
+	areas := o.targetWorkAreas()
 
-	sc := func(v int) int32 { return int32(math.Round(float64(v) * scale)) }
+	if len(o.panels) > 0 && sameWorkAreas(areas, o.panelAreas) {
+		return
+	}
+
+	o.destroyPanels()
+
+	for _, area := range areas {
+		panel := o.createPanel(area)
+		if panel == nil {
+			continue
+		}
+
+		o.panels[panel.hwnd] = panel
+	}
+
+	o.panelAreas = areas
+
+	// the fresh panels start hidden, so the show path has to run again
+	o.visible = false
+
+	o.logger.Debugw("Rebuilt overlay panels", "count", len(o.panels))
+}
+
+func (o *WindowsOSD) createPanel(area win.RECT) *osdPanel {
+
+	// created at the monitor's own origin so GetDpiForWindow resolves against it
+	hwnd := win.CreateWindowEx(
+		win.WS_EX_LAYERED|win.WS_EX_TRANSPARENT|win.WS_EX_TOOLWINDOW|
+			win.WS_EX_NOACTIVATE|win.WS_EX_TOPMOST,
+		o.classNameW,
+		o.classNameW,
+		win.WS_POPUP,
+		area.Left, area.Top, 1, 1,
+		0, 0, o.hInstance, nil)
+
+	if hwnd == 0 {
+		o.logger.Warnw("Failed to create overlay panel", "area", area)
+
+		return nil
+	}
+
+	setLayeredWindowAttributes(hwnd, 0, 0, lwaAlpha)
+
+	return &osdPanel{hwnd: hwnd, work: area}
+}
+
+func (o *WindowsOSD) destroyPanels() {
+	for hwnd, panel := range o.panels {
+		panel.destroyFonts()
+		win.DestroyWindow(hwnd)
+		delete(o.panels, hwnd)
+	}
+
+	o.panelAreas = nil
+}
+
+// targetWorkAreas returns the work area of every monitor the overlay should appear
+// on, honouring the osd.monitors setting
+func (o *WindowsOSD) targetWorkAreas() []win.RECT {
+	if strings.EqualFold(o.deej.config.OSD.Monitors, "primary") {
+		return []win.RECT{primaryWorkArea()}
+	}
+
+	areas := enumerateWorkAreas()
+	if len(areas) == 0 {
+		return []win.RECT{primaryWorkArea()}
+	}
+
+	return areas
+}
+
+func (o *WindowsOSD) relayoutPanels(rows int) {
+	for _, panel := range o.panels {
+		o.relayoutPanel(panel, rows)
+	}
+
+	o.lastRows = rows
+}
+
+// relayoutPanel resizes and repositions one panel. The panel is anchored to its
+// configured edge and grows away from it, so with a bottom position the bottom row
+// stays put no matter how many sliders are shown
+func (o *WindowsOSD) relayoutPanel(panel *osdPanel, rows int) {
+	o.ensurePanelMetrics(panel)
+
+	sc := func(v int) int32 { return int32(math.Round(float64(v) * panel.scale)) }
 
 	width := sc(osdWidth)
 	height := sc(osdPadding)*2 +
 		int32(rows)*sc(osdRowHeight) +
 		int32(rows-1)*sc(osdRowGap)
 
-	work := primaryWorkArea()
+	work := panel.work
 	offset := sc(o.deej.config.OSD.Offset)
 
 	var x, y int32
@@ -378,26 +539,48 @@ func (o *WindowsOSD) relayout(hwnd win.HWND, rows int) {
 		y = work.Bottom - height
 	}
 
-	win.SetWindowPos(hwnd, win.HWND_TOPMOST, x, y, width, height, win.SWP_NOACTIVATE)
+	win.SetWindowPos(panel.hwnd, win.HWND_TOPMOST, x, y, width, height, win.SWP_NOACTIVATE)
 
-	// rounded corners. once the region is handed over, windows owns it -
-	// deleting it here would be a use-after-free
+	// rounded corners. once the region is handed over, windows owns it - deleting
+	// it here would be a use-after-free
 	radius := sc(osdCornerRad) * 2
 	if rgn := createRoundRectRgn(0, 0, width+1, height+1, radius, radius); rgn != 0 {
-		setWindowRgn(hwnd, rgn, false)
+		setWindowRgn(panel.hwnd, rgn, false)
 	}
-
-	o.lastRows = rows
 }
 
-func (o *WindowsOSD) paint(hwnd win.HWND) {
+// ensurePanelMetrics recreates the panel's fonts when its effective scale changed
+func (o *WindowsOSD) ensurePanelMetrics(panel *osdPanel) {
+	dpi := win.GetDpiForWindow(panel.hwnd)
+	if dpi == 0 {
+		dpi = 96
+	}
+
+	configured := o.deej.config.OSD.Scale
+	if configured <= 0 {
+		configured = 1
+	}
+
+	scale := float64(dpi) / 96.0 * configured
+
+	if panel.fontLabel != 0 && math.Abs(panel.scale-scale) < 0.001 {
+		return
+	}
+
+	panel.destroyFonts()
+	panel.fontLabel = createOSDFont(osdLabelPtSz, scale, int32(win.FW_SEMIBOLD))
+	panel.fontValue = createOSDFont(osdValuePtSz, scale, int32(win.FW_NORMAL))
+	panel.scale = scale
+}
+
+func (o *WindowsOSD) paintPanel(panel *osdPanel) {
 	var ps win.PAINTSTRUCT
 
-	hdc := win.BeginPaint(hwnd, &ps)
-	defer win.EndPaint(hwnd, &ps)
+	hdc := win.BeginPaint(panel.hwnd, &ps)
+	defer win.EndPaint(panel.hwnd, &ps)
 
 	var client win.RECT
-	win.GetClientRect(hwnd, &client)
+	win.GetClientRect(panel.hwnd, &client)
 
 	width := client.Right - client.Left
 	height := client.Bottom - client.Top
@@ -420,12 +603,11 @@ func (o *WindowsOSD) paint(hwnd win.HWND) {
 	fillRect(memDC, &client, o.brush(osdColorBackground))
 	win.SetBkMode(memDC, win.TRANSPARENT)
 
-	scale := o.scale(hwnd)
-	sc := func(v int) int32 { return int32(math.Round(float64(v) * scale)) }
-
 	// windows can send WM_PAINT before we've ever laid the panel out, so don't
 	// assume the fonts already exist. this is a no-op once they do
-	o.ensureFonts(scale)
+	o.ensurePanelMetrics(panel)
+
+	sc := func(v int) int32 { return int32(math.Round(float64(v) * panel.scale)) }
 
 	entries := o.snapshot()
 	rowHeight := sc(osdRowHeight)
@@ -459,11 +641,11 @@ func (o *WindowsOSD) paint(hwnd win.HWND) {
 		if o.deej.config.OSD.ShowPercentage {
 			value := fmt.Sprintf("%d%%", int(math.Round(float64(entry.Percent)*100)))
 
-			win.SelectObject(memDC, win.HGDIOBJ(o.fontValue))
+			win.SelectObject(memDC, win.HGDIOBJ(panel.fontValue))
 			drawText(memDC, value, &textRect, win.DT_RIGHT|win.DT_SINGLELINE|win.DT_VCENTER)
 		}
 
-		win.SelectObject(memDC, win.HGDIOBJ(o.fontLabel))
+		win.SelectObject(memDC, win.HGDIOBJ(panel.fontLabel))
 		drawText(memDC, entry.Label, &textRect,
 			win.DT_LEFT|win.DT_SINGLELINE|win.DT_VCENTER|win.DT_END_ELLIPSIS)
 
@@ -494,8 +676,22 @@ func (o *WindowsOSD) paint(hwnd win.HWND) {
 	win.BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, win.SRCCOPY)
 }
 
-// snapshot returns the current rows sorted by slider id. sorting by id rather
-// than by recency keeps a given slider in a fixed place, so the panel stays readable
+func (o *WindowsOSD) applyAlpha() {
+	alpha := byte(o.alpha)
+
+	for _, panel := range o.panels {
+		setLayeredWindowAttributes(panel.hwnd, 0, alpha, lwaAlpha)
+	}
+}
+
+func (o *WindowsOSD) invalidatePanels() {
+	for _, panel := range o.panels {
+		win.InvalidateRect(panel.hwnd, nil, false)
+	}
+}
+
+// snapshot returns the current rows sorted by slider id. Sorting by id rather than
+// by recency keeps a given slider in a fixed place, so the panel stays readable
 func (o *WindowsOSD) snapshot() []OSDEntry {
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -535,48 +731,36 @@ func (o *WindowsOSD) expireEntries() int {
 	return len(o.entries)
 }
 
-func (o *WindowsOSD) applyAlpha(hwnd win.HWND) {
-	setLayeredWindowAttributes(hwnd, 0, byte(o.alpha), lwaAlpha)
-}
+// checkExclusiveFullscreen reports whether a direct3d application currently owns a
+// display outright. It logs the transition once rather than on every move, so the
+// log says plainly why the overlay stayed away
+func (o *WindowsOSD) checkExclusiveFullscreen() bool {
+	var state int32
 
-// scale combines the monitor's dpi with the user's configured scale. the app
-// manifest declares per-monitor dpi awareness, so windows won't scale us itself
-func (o *WindowsOSD) scale(hwnd win.HWND) float64 {
-	dpi := win.GetDpiForWindow(hwnd)
-	if dpi == 0 {
-		dpi = 96
+	// S_OK is 0. on any failure we assume there's no exclusive fullscreen, which
+	// keeps the overlay's behaviour unchanged if the call ever goes wrong
+	ret, _, _ := syscall.SyscallN(procSHQueryUserNotificationState.Addr(),
+		uintptr(unsafe.Pointer(&state)))
+
+	if ret != 0 {
+		return false
 	}
 
-	configured := o.deej.config.OSD.Scale
-	if configured <= 0 {
-		configured = 1
+	fullscreen := state == qunsRunningD3DFullScreen
+
+	if fullscreen != o.inFullscreen {
+		o.inFullscreen = fullscreen
+
+		if fullscreen {
+			o.logger.Infow("A display is under exclusive fullscreen - no external window "+
+				"can be drawn over that one. Panels on the other monitors are unaffected",
+				"skipping", o.deej.config.OSD.SkipInExclusiveFullscreen)
+		} else {
+			o.logger.Debug("Exclusive fullscreen ended")
+		}
 	}
 
-	return float64(dpi) / 96.0 * configured
-}
-
-func (o *WindowsOSD) ensureFonts(scale float64) {
-	if o.fontLabel != 0 && math.Abs(o.fontScale-scale) < 0.001 {
-		return
-	}
-
-	o.destroyFonts()
-
-	o.fontLabel = createOSDFont(osdLabelPtSz, scale, int32(win.FW_SEMIBOLD))
-	o.fontValue = createOSDFont(osdValuePtSz, scale, int32(win.FW_NORMAL))
-	o.fontScale = scale
-}
-
-func (o *WindowsOSD) destroyFonts() {
-	if o.fontLabel != 0 {
-		win.DeleteObject(win.HGDIOBJ(o.fontLabel))
-		o.fontLabel = 0
-	}
-
-	if o.fontValue != 0 {
-		win.DeleteObject(win.HGDIOBJ(o.fontValue))
-		o.fontValue = 0
-	}
+	return fullscreen
 }
 
 // brush caches solid brushes by color so painting doesn't churn gdi objects
@@ -592,7 +776,7 @@ func (o *WindowsOSD) brush(color win.COLORREF) win.HBRUSH {
 }
 
 func (o *WindowsOSD) releaseResources() {
-	o.destroyFonts()
+	o.destroyPanels()
 
 	for color, brush := range o.brushes {
 		win.DeleteObject(win.HGDIOBJ(brush))
@@ -604,7 +788,7 @@ func (o *WindowsOSD) releaseResources() {
 		o.classAtom = 0
 	}
 
-	o.hwnd.Store(0)
+	o.controller.Store(0)
 	activeOSD = nil
 }
 
@@ -630,6 +814,53 @@ func drawText(hdc win.HDC, text string, rect *win.RECT, format uint32) {
 	}
 
 	win.DrawTextEx(hdc, &encoded[0], int32(len(encoded)-1), rect, format, nil)
+}
+
+// enumerateWorkAreas returns the usable area of every attached monitor, taskbar
+// excluded, ordered left to right so the set stays comparable between calls
+func enumerateWorkAreas() []win.RECT {
+	osdEnumMonitorsResult = nil
+
+	syscall.SyscallN(procEnumDisplayMonitors.Addr(), 0, 0, osdEnumMonitorsCallback, 0)
+
+	areas := osdEnumMonitorsResult
+	osdEnumMonitorsResult = nil
+
+	sort.Slice(areas, func(i, j int) bool {
+		if areas[i].Left != areas[j].Left {
+			return areas[i].Left < areas[j].Left
+		}
+
+		return areas[i].Top < areas[j].Top
+	})
+
+	return areas
+}
+
+func osdEnumMonitorsProc(monitor win.HMONITOR, hdc win.HDC, clip *win.RECT, data uintptr) uintptr {
+	var info win.MONITORINFO
+	info.CbSize = uint32(unsafe.Sizeof(info))
+
+	if win.GetMonitorInfo(monitor, &info) {
+		osdEnumMonitorsResult = append(osdEnumMonitorsResult, info.RcWork)
+	}
+
+	// a non-zero return continues the enumeration
+	return 1
+}
+
+func sameWorkAreas(a []win.RECT, b []win.RECT) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for idx := range a {
+		if a[idx] != b[idx] {
+			return false
+		}
+	}
+
+	return true
 }
 
 // primaryWorkArea returns the primary monitor's usable area, taskbar excluded

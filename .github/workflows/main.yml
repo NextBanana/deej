@@ -2,38 +2,47 @@ name: Build
 
 on:
   push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+    paths-ignore:
+      - "**.md"
+      - "assets/**"
+      - "docs/**"
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Build
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-        mode: [release, dev]
-        go: ["1.14"]
+  windows:
+    name: Build (Windows)
+    runs-on: windows-latest
 
     steps:
-      - name: Setup Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: ${{ matrix.go }}
-
-      - name: Install prerequisites (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libappindicator3-dev libwebkit2gtk-4.0-dev
-
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+        with:
+          # the build scripts call `git rev-list` and `git describe --tags`,
+          # so the full history and all tags need to be present
+          fetch-depth: 0
 
-      - name: Build deej (Windows)
-        if: runner.os == 'Windows'
-        run: pkg/deej/scripts/windows/build-${{ matrix.mode }}.bat
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          # takes the version straight from the `go` directive in go.mod,
+          # so this never drifts out of sync again
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build deej (release)
+        run: pkg\deej\scripts\windows\build-release.bat
         shell: cmd
 
-      - name: Build deej (Linux)
-        if: runner.os == 'Linux'
-        run: pkg/deej/scripts/linux/build-${{ matrix.mode }}.sh
+      - name: Build deej (dev)
+        run: pkg\deej\scripts\windows\build-dev.bat
+        shell: cmd
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: deej-windows-run${{ github.run_number }}
+          path: |
+            deej-release.exe
+            deej-dev.exe
+          if-no-files-found: error
+          retention-days: 30

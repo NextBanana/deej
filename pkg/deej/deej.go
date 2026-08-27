@@ -25,6 +25,7 @@ type Deej struct {
 	config   *CanonicalConfig
 	serial   *SerialIO
 	sessions *sessionMap
+	osd      OSD
 
 	stopChannel chan bool
 	version     string
@@ -76,6 +77,14 @@ func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	}
 
 	d.sessions = sessions
+
+	osd, err := newOSD(d, logger)
+	if err != nil {
+		logger.Errorw("Failed to create OSD", "error", err)
+		return nil, fmt.Errorf("create new OSD: %w", err)
+	}
+
+	d.osd = osd
 
 	logger.Debug("Created deej instance")
 
@@ -138,6 +147,12 @@ func (d *Deej) setupInterruptHandler() {
 func (d *Deej) run() {
 	d.logger.Info("Run loop starting")
 
+	// bring up the overlay. a failure here shouldn't keep deej from controlling
+	// volume, so it's logged and ignored rather than fatal
+	if err := d.osd.Start(); err != nil {
+		d.logger.Warnw("Failed to start OSD, continuing without it", "error", err)
+	}
+
 	// watch the config file for changes
 	go d.config.WatchConfigFileChanges()
 
@@ -192,6 +207,7 @@ func (d *Deej) stop() error {
 
 	d.config.StopWatchingConfigFile()
 	d.serial.Stop()
+	d.osd.Stop()
 
 	// release the session map
 	if err := d.sessions.release(); err != nil {

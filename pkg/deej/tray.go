@@ -23,6 +23,8 @@ func (d *Deej) initializeTray(onDone func()) {
 		refreshSessions := systray.AddMenuItem("Re-scan audio sessions", "Manually refresh audio sessions if something's stuck")
 		refreshSessions.SetIcon(icon.RefreshSessions)
 
+		testOverlay := systray.AddMenuItem("Show test overlay", "Preview the on-screen volume overlay")
+
 		if d.version != "" {
 			systray.AddSeparator()
 			versionInfo := systray.AddMenuItem(d.version, "")
@@ -63,6 +65,12 @@ func (d *Deej) initializeTray(onDone func()) {
 					// performance: the reason that forcing a refresh here is okay is that users can't spam the
 					// right-click -> select-this-option sequence at a rate that's meaningful to performance
 					d.sessions.refreshSessions(true)
+
+				// preview the overlay
+				case <-testOverlay.ClickedCh:
+					logger.Info("Test overlay menu item clicked, showing preview")
+
+					d.showOSDPreview()
 				}
 			}
 		}()

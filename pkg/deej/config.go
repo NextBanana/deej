@@ -3,6 +3,7 @@ package deej
 import (
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,10 @@ import (
 // as well as loading/file watching logic for deej's configuration file
 type CanonicalConfig struct {
 	SliderMapping *sliderMap
+
+	SliderLabels map[int]string
+
+	OSD OSDConfig
 
 	ConnectionInfo struct {
 		COMPort  string
@@ -37,6 +42,38 @@ type CanonicalConfig struct {
 	internalConfig *viper.Viper
 }
 
+// OSDConfig holds everything that shapes deej's on-screen overlay
+type OSDConfig struct {
+
+	// Enabled turns the overlay off entirely without removing its configuration
+	Enabled bool
+
+	// Position anchors the panel, i.e. "bottom-center" or "top-right"
+	Position string
+
+	// Offset is the distance in pixels between the panel and its anchored edge
+	Offset int
+
+	// RowTimeoutMS is how long a single row stays on screen after its slider last moved
+	RowTimeoutMS int
+
+	// FadeMS is the duration of the fade in and out
+	FadeMS int
+
+	// Scale multiplies the overlay's size on top of the monitor's dpi scaling
+	Scale float64
+
+	// ShowPercentage adds a numeric level to the right of every row
+	ShowPercentage bool
+
+	// DimInactive greys out rows whose target application isn't running
+	DimInactive bool
+
+	// SuppressStartupMS silences the overlay right after startup and after a config
+	// reload, both of which emit a move event for every slider at once
+	SuppressStartupMS int
+}
+
 const (
 	userConfigFilepath     = "config.yaml"
 	internalConfigFilepath = "preferences.yaml"
@@ -49,13 +86,31 @@ const (
 	configType = "yaml"
 
 	configKeySliderMapping       = "slider_mapping"
+	configKeySliderLabels        = "slider_labels"
 	configKeyInvertSliders       = "invert_sliders"
 	configKeyCOMPort             = "com_port"
 	configKeyBaudRate            = "baud_rate"
 	configKeyNoiseReductionLevel = "noise_reduction"
 
+	configKeyOSDEnabled           = "osd.enabled"
+	configKeyOSDPosition          = "osd.position"
+	configKeyOSDOffset            = "osd.offset"
+	configKeyOSDRowTimeoutMS      = "osd.row_timeout_ms"
+	configKeyOSDFadeMS            = "osd.fade_ms"
+	configKeyOSDScale             = "osd.scale"
+	configKeyOSDShowPercentage    = "osd.show_percentage"
+	configKeyOSDDimInactive       = "osd.dim_inactive"
+	configKeyOSDSuppressStartupMS = "osd.suppress_startup_ms"
+
 	defaultCOMPort  = "COM4"
 	defaultBaudRate = 9600
+
+	defaultOSDPosition          = "bottom-center"
+	defaultOSDOffset            = 120
+	defaultOSDRowTimeoutMS      = 1500
+	defaultOSDFadeMS            = 200
+	defaultOSDScale             = 1.0
+	defaultOSDSuppressStartupMS = 1500
 )
 
 // has to be defined as a non-constant because we're using path.Join
@@ -89,6 +144,17 @@ func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, 
 	userConfig.SetDefault(configKeyInvertSliders, false)
 	userConfig.SetDefault(configKeyCOMPort, defaultCOMPort)
 	userConfig.SetDefault(configKeyBaudRate, defaultBaudRate)
+
+	userConfig.SetDefault(configKeySliderLabels, map[string]string{})
+	userConfig.SetDefault(configKeyOSDEnabled, true)
+	userConfig.SetDefault(configKeyOSDPosition, defaultOSDPosition)
+	userConfig.SetDefault(configKeyOSDOffset, defaultOSDOffset)
+	userConfig.SetDefault(configKeyOSDRowTimeoutMS, defaultOSDRowTimeoutMS)
+	userConfig.SetDefault(configKeyOSDFadeMS, defaultOSDFadeMS)
+	userConfig.SetDefault(configKeyOSDScale, defaultOSDScale)
+	userConfig.SetDefault(configKeyOSDShowPercentage, true)
+	userConfig.SetDefault(configKeyOSDDimInactive, true)
+	userConfig.SetDefault(configKeyOSDSuppressStartupMS, defaultOSDSuppressStartupMS)
 
 	internalConfig := viper.New()
 	internalConfig.SetConfigName(internalConfigName)
@@ -239,6 +305,29 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
 
+	cc.SliderLabels = sliderLabelsFromConfig(cc.userConfig.GetStringMapString(configKeySliderLabels))
+
+	cc.OSD = OSDConfig{
+		Enabled:           cc.userConfig.GetBool(configKeyOSDEnabled),
+		Position:          strings.ToLower(cc.userConfig.GetString(configKeyOSDPosition)),
+		Offset:            cc.userConfig.GetInt(configKeyOSDOffset),
+		RowTimeoutMS:      cc.userConfig.GetInt(configKeyOSDRowTimeoutMS),
+		FadeMS:            cc.userConfig.GetInt(configKeyOSDFadeMS),
+		Scale:             cc.userConfig.GetFloat64(configKeyOSDScale),
+		ShowPercentage:    cc.userConfig.GetBool(configKeyOSDShowPercentage),
+		DimInactive:       cc.userConfig.GetBool(configKeyOSDDimInactive),
+		SuppressStartupMS: cc.userConfig.GetInt(configKeyOSDSuppressStartupMS),
+	}
+
+	// guard against values that would make the overlay invisible or never disappear
+	if cc.OSD.Scale <= 0 {
+		cc.OSD.Scale = defaultOSDScale
+	}
+
+	if cc.OSD.RowTimeoutMS <= 0 {
+		cc.OSD.RowTimeoutMS = defaultOSDRowTimeoutMS
+	}
+
 	cc.logger.Debug("Populated config fields from vipers")
 
 	return nil
@@ -250,4 +339,21 @@ func (cc *CanonicalConfig) onConfigReloaded() {
 	for _, consumer := range cc.reloadConsumers {
 		consumer <- true
 	}
+}
+
+// sliderLabelsFromConfig turns the string-keyed map viper hands us into
+// something indexed the same way slider move events are
+func sliderLabelsFromConfig(raw map[string]string) map[int]string {
+	labels := make(map[int]string, len(raw))
+
+	for sliderIdxString, label := range raw {
+		sliderIdx, err := strconv.Atoi(sliderIdxString)
+		if err != nil {
+			continue
+		}
+
+		labels[sliderIdx] = label
+	}
+
+	return labels
 }

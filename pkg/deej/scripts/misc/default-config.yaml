@@ -15,6 +15,57 @@ slider_mapping:
     - rocketleague.exe
   4: discord.exe
 
+# optional friendly names shown on the on-screen overlay. sliders without an entry
+# here fall back to a name derived from their mapping, i.e. 'chrome.exe' -> 'Chrome'
+slider_labels:
+  0: Master
+  1: Browser
+  2: Spotify
+  3: Games
+  4: Discord
+
+# on-screen overlay shown whenever a slider moves
+osd:
+  enabled: true
+
+  # where the overlay appears: "all" puts a panel on every attached monitor,
+  # "primary" restricts it to the primary one. showing it everywhere means a game
+  # holding one display exclusively can't hide it - the other monitors still show it
+  monitors: all
+
+  # bottom-center, bottom-left, bottom-right, top-center, top-left, top-right.
+  # the panel is anchored to this edge and grows away from it, so it stays put
+  # no matter how many sliders are shown at once
+  position: bottom-center
+
+  # distance in pixels between the panel and the edge it's anchored to
+  offset: 120
+
+  # how long a row stays on screen after its slider last moved. every row has its
+  # own timer, so rows disappear in the order they were last touched
+  row_timeout_ms: 1500
+
+  fade_ms: 200
+
+  # multiplies the panel's size on top of your monitor's own dpi scaling
+  scale: 1.0
+
+  show_percentage: true
+
+  # draw rows dimmed when the slider's target isn't currently running
+  dim_inactive: true
+
+  # silence the overlay for this long after startup and after a config reload.
+  # both of those make deej re-send every slider position at once, which would
+  # otherwise pop the full panel up unprompted
+  suppress_startup_ms: 1500
+
+  # drop overlay rows while a Direct3D application owns the display outright.
+  # nothing drawn from outside that process can appear there anyway, and forcing a
+  # topmost window at that moment can make the game flip out of fullscreen.
+  # leave this false to always try - the log will tell you when it happens
+  skip_in_exclusive_fullscreen: false
+
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
 invert_sliders: false
 

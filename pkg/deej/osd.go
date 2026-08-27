@@ -1,5 +1,10 @@
 package deej
 
+import (
+	"fmt"
+	"sort"
+)
+
 // OSDEntry is a single row of the on-screen overlay, describing one slider's
 // current state at the moment it was moved
 type OSDEntry struct {
@@ -35,22 +40,58 @@ type OSD interface {
 	Stop()
 }
 
-// demo values for the tray's overlay preview - one dimmed row is included
-// on purpose, so the inactive styling can be checked without closing an app
-var osdPreviewEntries = []OSDEntry{
-	{SliderID: 0, Label: "Master", Percent: 0.72, Active: true},
-	{SliderID: 1, Label: "Browser", Percent: 0.45, Active: true},
-	{SliderID: 2, Label: "Spotify", Percent: 0.30, Active: false},
+// levels used for the preview's bars, cycled across however many sliders exist.
+// they're deliberately uneven so the bar rendering can be judged at a glance
+var osdPreviewLevels = []float32{0.72, 0.45, 0.30, 0.88, 0.15, 0.60}
+
+// showOSDPreview displays a sample overlay built from the user's own configuration,
+// so the preview has the same number of rows - and therefore the same size - as the
+// panel they'll see in practice. This is what makes tuning position, scale and timing
+// possible without touching the hardware
+func (d *Deej) showOSDPreview() {
+	sliderIDs := d.configuredSliderIDs()
+
+	// nothing configured yet - still show something, or the menu item looks broken
+	if len(sliderIDs) == 0 {
+		sliderIDs = []int{0}
+	}
+
+	for idx, sliderID := range sliderIDs {
+		d.osd.ShowEntry(OSDEntry{
+			SliderID: sliderID,
+			Label:    d.osdLabel(sliderID, fmt.Sprintf("Slider %d", sliderID)),
+			Percent:  osdPreviewLevels[idx%len(osdPreviewLevels)],
+
+			// every third row is previewed as inactive, so the dimmed styling can be
+			// judged without having to close an application first
+			Active: idx%3 != 2,
+		})
+	}
 }
 
-// showOSDPreview displays a sample overlay, using the user's own slider labels
-// where they've configured them. This exists to make tuning position, scale and
-// timing possible without touching the hardware
-func (d *Deej) showOSDPreview() {
-	for _, entry := range osdPreviewEntries {
-		entry.Label = d.osdLabel(entry.SliderID, entry.Label)
-		d.osd.ShowEntry(entry)
+// configuredSliderIDs returns every slider the user has either mapped to a target
+// or given a label, sorted ascending. Sliders left empty in the config are skipped
+func (d *Deej) configuredSliderIDs() []int {
+	unique := make(map[int]bool)
+
+	d.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+		if len(targets) > 0 {
+			unique[sliderIdx] = true
+		}
+	})
+
+	for sliderIdx := range d.config.SliderLabels {
+		unique[sliderIdx] = true
 	}
+
+	sliderIDs := make([]int, 0, len(unique))
+	for sliderIdx := range unique {
+		sliderIDs = append(sliderIDs, sliderIdx)
+	}
+
+	sort.Ints(sliderIDs)
+
+	return sliderIDs
 }
 
 // osdLabel returns the configured label for a slider, falling back to the

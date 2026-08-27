@@ -364,6 +364,20 @@ func (o *WindowsOSD) relayout(hwnd win.HWND, rows int) {
 		x, y = work.Left+(work.Right-work.Left-width)/2, work.Bottom-height-offset
 	}
 
+	// with many rows at a large scale the panel can outgrow the work area, and a
+	// bottom anchor would then push its top edge off screen. keep it on the monitor
+	if area := work.Bottom - work.Top; height > area {
+		height = area
+	}
+
+	if y < work.Top {
+		y = work.Top
+	}
+
+	if y+height > work.Bottom {
+		y = work.Bottom - height
+	}
+
 	win.SetWindowPos(hwnd, win.HWND_TOPMOST, x, y, width, height, win.SWP_NOACTIVATE)
 
 	// rounded corners. once the region is handed over, windows owns it -

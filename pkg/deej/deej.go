@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	"go.uber.org/zap"
 
@@ -30,6 +31,9 @@ type Deej struct {
 	stopChannel chan bool
 	version     string
 	verbose     bool
+
+	// unix nanos until which slider-driven overlay rows are dropped
+	osdSuppressUntil atomic.Int64
 }
 
 // NewDeej creates a Deej instance
@@ -152,6 +156,9 @@ func (d *Deej) run() {
 	if err := d.osd.Start(); err != nil {
 		d.logger.Warnw("Failed to start OSD, continuing without it", "error", err)
 	}
+
+	// has to be set up before the config watcher starts, so no reload is missed
+	d.setupOSDSuppression()
 
 	// watch the config file for changes
 	go d.config.WatchConfigFileChanges()

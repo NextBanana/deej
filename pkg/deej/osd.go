@@ -3,6 +3,9 @@ package deej
 import (
 	"fmt"
 	"sort"
+	"strings"
+	"time"
+	"unicode"
 )
 
 // OSDEntry is a single row of the on-screen overlay, describing one slider's
@@ -59,7 +62,7 @@ func (d *Deej) showOSDPreview() {
 	for idx, sliderID := range sliderIDs {
 		d.osd.ShowEntry(OSDEntry{
 			SliderID: sliderID,
-			Label:    d.osdLabel(sliderID, fmt.Sprintf("Slider %d", sliderID)),
+			Label:    d.osdLabel(sliderID, d.osdFallbackLabel(sliderID)),
 			Percent:  osdPreviewLevels[idx%len(osdPreviewLevels)],
 
 			// every third row is previewed as inactive, so the dimmed styling can be
@@ -102,4 +105,119 @@ func (d *Deej) osdLabel(sliderID int, fallback string) string {
 	}
 
 	return fallback
+}
+
+// showSliderOSD is the path real slider movements take to the overlay. It applies
+// the startup suppression that the manual preview deliberately bypasses
+func (d *Deej) showSliderOSD(entry OSDEntry) {
+	if d.osdSuppressed() {
+		return
+	}
+
+	d.osd.ShowEntry(entry)
+}
+
+// setupOSDSuppression silences the overlay for a moment after startup and after
+// every config reload. Both of those make serial.go forget its last known slider
+// values, which makes the next line from the board emit a move event for every
+// single slider at once - without this, the full panel would pop up unprompted
+func (d *Deej) setupOSDSuppression() {
+	d.suppressOSD()
+
+	configReloadedChannel := d.config.SubscribeToChanges()
+
+	go func() {
+		for {
+			<-configReloadedChannel
+			d.suppressOSD()
+		}
+	}()
+}
+
+func (d *Deej) suppressOSD() {
+	window := time.Duration(d.config.OSD.SuppressStartupMS) * time.Millisecond
+
+	if window <= 0 {
+		d.osdSuppressUntil.Store(0)
+
+		return
+	}
+
+	d.osdSuppressUntil.Store(time.Now().Add(window).UnixNano())
+}
+
+func (d *Deej) osdSuppressed() bool {
+	until := d.osdSuppressUntil.Load()
+
+	return until != 0 && time.Now().UnixNano() < until
+}
+
+// osdLabelFromTargets derives a display name from a slider's configured targets,
+// for sliders the user hasn't named in slider_labels
+func osdLabelFromTargets(targets []string) string {
+	if len(targets) == 0 {
+		return ""
+	}
+
+	label := osdFriendlyTargetName(targets[0])
+
+	// groups get a counter rather than a long list, which wouldn't fit anyway
+	if len(targets) > 1 {
+		label = fmt.Sprintf("%s +%d", label, len(targets)-1)
+	}
+
+	return label
+}
+
+func osdFriendlyTargetName(target string) string {
+	target = strings.TrimSpace(target)
+	normalized := strings.ToLower(target)
+
+	switch normalized {
+	case masterSessionName:
+		return "Master"
+	case systemSessionName:
+		return "System"
+	case inputSessionName:
+		return "Microphone"
+	case specialTargetTransformPrefix + specialTargetCurrentWindow:
+		return "Current app"
+	case specialTargetTransformPrefix + specialTargetAllUnmapped:
+		return "Unmapped apps"
+	}
+
+	// device targets look like "Speakers (Realtek High Definition Audio)" - the
+	// friendly part in front is enough to tell devices apart, and it actually fits
+	if deviceSessionKeyPattern.MatchString(target) {
+		if idx := strings.Index(target, " ("); idx > 0 {
+			return target[:idx]
+		}
+
+		return target
+	}
+
+	// plain process names: drop the extension and give it a capital letter
+	return osdCapitalize(strings.TrimSuffix(normalized, ".exe"))
+}
+
+func osdCapitalize(value string) string {
+	if value == "" {
+		return value
+	}
+
+	runes := []rune(value)
+
+	return string(unicode.ToUpper(runes[0])) + string(runes[1:])
+}
+
+// osdFallbackLabel derives a slider's name from its configured targets, falling
+// back to its index when it has none
+func (d *Deej) osdFallbackLabel(sliderID int) string {
+	if targets, ok := d.config.SliderMapping.get(sliderID); ok {
+		if label := osdLabelFromTargets(targets); label != "" {
+			return label
+		}
+	}
+
+	return fmt.Sprintf("Slider %d", sliderID)
 }

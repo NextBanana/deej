@@ -1,0 +1,67 @@
+# process names are case-insensitive
+# you can use 'master' to indicate the master channel, or a list of process names to create a group
+# you can use 'mic' to control your mic input level (uses the default recording device)
+# you can use 'deej.unmapped' to control all apps that aren't bound to any slider (this ignores master, system, mic and device-targeting sessions)
+# windows only - you can use 'deej.current' to control the currently active app (whether full-screen or not)
+# windows only - you can use a device's full name, i.e. "Speakers (Realtek High Definition Audio)", to bind it. this works for both output and input devices
+# windows only - you can use 'system' to control the "system sounds" volume
+# important: slider indexes start at 0, regardless of which analog pins you're using!
+slider_mapping:
+  0: master
+  1: chrome.exe
+  2: spotify.exe
+  3:
+    - pathofexile_x64.exe
+    - rocketleague.exe
+  4: discord.exe
+
+# optional friendly names shown on the on-screen overlay. sliders without an entry
+# here fall back to a name derived from their mapping, i.e. 'chrome.exe' -> 'Chrome'
+slider_labels:
+  0: Master
+  1: Browser
+  2: Spotify
+  3: Games
+  4: Discord
+
+# on-screen overlay shown whenever a slider moves
+osd:
+  enabled: true
+
+  # bottom-center, bottom-left, bottom-right, top-center, top-left, top-right.
+  # the panel is anchored to this edge and grows away from it, so it stays put
+  # no matter how many sliders are shown at once
+  position: bottom-center
+
+  # distance in pixels between the panel and the edge it's anchored to
+  offset: 120
+
+  # how long a row stays on screen after its slider last moved. every row has its
+  # own timer, so rows disappear in the order they were last touched
+  row_timeout_ms: 1500
+
+  fade_ms: 200
+
+  # multiplies the panel's size on top of your monitor's own dpi scaling
+  scale: 1.0
+
+  show_percentage: true
+
+  # draw rows dimmed when the slider's target isn't currently running
+  dim_inactive: true
+
+  # silence the overlay for this long after startup and after a config reload.
+  # both of those make deej re-send every slider position at once, which would
+  # otherwise pop the full panel up unprompted
+  suppress_startup_ms: 1500
+
+# set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
+invert_sliders: false
+
+# settings for connecting to the arduino board
+com_port: COM4
+baud_rate: 9600
+
+# adjust the amount of signal noise reduction depending on your hardware quality
+# supported values are "low" (excellent hardware), "default" (regular hardware) or "high" (bad, noisy hardware)
+noise_reduction: default

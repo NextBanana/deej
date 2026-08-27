@@ -257,6 +257,19 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 		}
 	}
 
+	// feed the overlay. this happens before any session refresh below, so the panel
+	// appears immediately rather than after a potentially slow re-enumeration.
+	// targetFound decides whether the row is drawn dimmed - a slider whose app isn't
+	// running still shows its level, just greyed out
+	if len(targets) > 0 {
+		m.deej.showSliderOSD(OSDEntry{
+			SliderID: event.SliderID,
+			Label:    m.deej.osdLabel(event.SliderID, osdLabelFromTargets(targets)),
+			Percent:  event.PercentValue,
+			Active:   targetFound,
+		})
+	}
+
 	// if we still haven't found a target or the volume adjustment failed, maybe look for the target again.
 	// processes could've opened since the last time this slider moved.
 	// if they haven't, the cooldown will take care to not spam it up

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -67,6 +68,10 @@ const (
 	osdMinBarSize = 2
 )
 
+// how often the monitor layout is re-checked. it doesn't change dozens of times a
+// second, and enumerating on every slider event is needless churn
+var osdMonitorRecheckInterval = time.Second
+
 // theme. the dimmed variants are used for rows whose target isn't running
 var (
 	osdColorBackground = win.RGB(32, 32, 32)
@@ -103,6 +108,13 @@ type osdPanel struct {
 	scale     float64
 	fontLabel win.HFONT
 	fontValue win.HFONT
+
+	// last applied geometry. a slider sweep fires dozens of events at an unchanged
+	// row count, and re-issuing SetWindowPos plus a fresh window region for each of
+	// them is pure gdi churn
+	placed        bool
+	x, y          int32
+	width, height int32
 }
 
 func (p *osdPanel) destroyFonts() {
@@ -135,6 +147,13 @@ type WindowsOSD struct {
 	panels     map[win.HWND]*osdPanel
 	panelAreas []win.RECT
 	brushes    map[win.COLORREF]win.HBRUSH
+
+	// snapshot of the overlay config, taken once per update on this thread. the
+	// config object itself is rewritten in place by the watcher goroutine, so
+	// reading it field by field mid-paint would race with that rewrite
+	cfg OSDConfig
+
+	lastEnumerated time.Time
 
 	visible      bool
 	fadingOut    bool
@@ -206,6 +225,32 @@ func (o *WindowsOSD) Stop() {
 func (o *WindowsOSD) uiThread(ready chan error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
+	// the overlay is a convenience. if it ever panics, deej itself should carry on
+	// controlling volume rather than disappearing along with it
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			o.logger.Errorw("Overlay thread panicked, continuing without the overlay",
+				"panic", recovered, "stack", string(debug.Stack()))
+
+			// so nothing posts to a window that no longer has a message pump
+			o.controller.Store(0)
+
+			// in case this happened before Start() was told we were up
+			select {
+			case ready <- fmt.Errorf("overlay thread panicked: %v", recovered):
+			default:
+			}
+		}
+	}()
+
+	// creating windows and calling shell apis both expect a com-initialised thread.
+	// the session finder does the same on its own thread
+	if hr := win.CoInitializeEx(nil, win.COINIT_APARTMENTTHREADED); hr < 0 {
+		o.logger.Warnw("Failed to initialize COM on the overlay thread", "hresult", hr)
+	} else {
+		defer win.CoUninitialize()
+	}
 
 	if err := o.createController(); err != nil {
 		o.logger.Errorw("Failed to create overlay controller window", "error", err)
@@ -311,7 +356,9 @@ func (o *WindowsOSD) onUpdate() {
 		return
 	}
 
-	if o.checkExclusiveFullscreen() && o.deej.config.OSD.SkipInExclusiveFullscreen {
+	o.cfg = o.deej.config.OSD
+
+	if o.cfg.SkipInExclusiveFullscreen && o.checkExclusiveFullscreen() {
 
 		// drop the pending rows rather than keeping them - the panels stay hidden,
 		// so their timer never runs and nothing would ever expire them
@@ -370,7 +417,7 @@ func (o *WindowsOSD) onTick() {
 		o.invalidatePanels()
 	}
 
-	fadeMS := o.deej.config.OSD.FadeMS
+	fadeMS := o.cfg.FadeMS
 	step := 255.0
 
 	if fadeMS > 0 {
@@ -411,6 +458,19 @@ func (o *WindowsOSD) onTick() {
 // called on every update, which is cheap and means display changes, resolution
 // switches and monitors being turned off need no separate handling
 func (o *WindowsOSD) ensurePanels() {
+
+	// a rebuild destroys and recreates live windows. doing that while the panels are
+	// on screen would tear one down mid-fade, so it waits until they're hidden again
+	if o.visible && len(o.panels) > 0 {
+		return
+	}
+
+	if len(o.panels) > 0 && time.Since(o.lastEnumerated) < osdMonitorRecheckInterval {
+		return
+	}
+
+	o.lastEnumerated = time.Now()
+
 	areas := o.targetWorkAreas()
 
 	if len(o.panels) > 0 && sameWorkAreas(areas, o.panelAreas) {
@@ -472,7 +532,7 @@ func (o *WindowsOSD) destroyPanels() {
 // targetWorkAreas returns the work area of every monitor the overlay should appear
 // on, honouring the osd.monitors setting
 func (o *WindowsOSD) targetWorkAreas() []win.RECT {
-	if strings.EqualFold(o.deej.config.OSD.Monitors, "primary") {
+	if strings.EqualFold(o.cfg.Monitors, "primary") {
 		return []win.RECT{primaryWorkArea()}
 	}
 
@@ -506,11 +566,11 @@ func (o *WindowsOSD) relayoutPanel(panel *osdPanel, rows int) {
 		int32(rows-1)*sc(osdRowGap)
 
 	work := panel.work
-	offset := sc(o.deej.config.OSD.Offset)
+	offset := sc(o.cfg.Offset)
 
 	var x, y int32
 
-	switch o.deej.config.OSD.Position {
+	switch o.cfg.Position {
 	case "top-left":
 		x, y = work.Left+offset, work.Top+offset
 	case "top-right":
@@ -539,14 +599,24 @@ func (o *WindowsOSD) relayoutPanel(panel *osdPanel, rows int) {
 		y = work.Bottom - height
 	}
 
+	if panel.placed && panel.x == x && panel.y == y &&
+		panel.width == width && panel.height == height {
+
+		return
+	}
+
 	win.SetWindowPos(panel.hwnd, win.HWND_TOPMOST, x, y, width, height, win.SWP_NOACTIVATE)
 
 	// rounded corners. once the region is handed over, windows owns it - deleting
-	// it here would be a use-after-free
+	// it here would be a use-after-free, and setting a new one frees the old
 	radius := sc(osdCornerRad) * 2
 	if rgn := createRoundRectRgn(0, 0, width+1, height+1, radius, radius); rgn != 0 {
 		setWindowRgn(panel.hwnd, rgn, false)
 	}
+
+	panel.placed = true
+	panel.x, panel.y = x, y
+	panel.width, panel.height = width, height
 }
 
 // ensurePanelMetrics recreates the panel's fonts when its effective scale changed
@@ -556,7 +626,7 @@ func (o *WindowsOSD) ensurePanelMetrics(panel *osdPanel) {
 		dpi = 96
 	}
 
-	configured := o.deej.config.OSD.Scale
+	configured := o.cfg.Scale
 	if configured <= 0 {
 		configured = 1
 	}
@@ -623,7 +693,7 @@ func (o *WindowsOSD) paintPanel(panel *osdPanel) {
 		textColor := osdColorText
 		barColor := osdColorBarFill
 
-		if !entry.Active && o.deej.config.OSD.DimInactive {
+		if !entry.Active && o.cfg.DimInactive {
 			textColor = osdColorTextDim
 			barColor = osdColorBarDim
 		}
@@ -638,7 +708,7 @@ func (o *WindowsOSD) paintPanel(panel *osdPanel) {
 			Bottom: top + rowHeight - barHeight - sc(6),
 		}
 
-		if o.deej.config.OSD.ShowPercentage {
+		if o.cfg.ShowPercentage {
 			value := fmt.Sprintf("%d%%", int(math.Round(float64(entry.Percent)*100)))
 
 			win.SelectObject(memDC, win.HGDIOBJ(panel.fontValue))
@@ -752,9 +822,8 @@ func (o *WindowsOSD) checkExclusiveFullscreen() bool {
 		o.inFullscreen = fullscreen
 
 		if fullscreen {
-			o.logger.Infow("A display is under exclusive fullscreen - no external window "+
-				"can be drawn over that one. Panels on the other monitors are unaffected",
-				"skipping", o.deej.config.OSD.SkipInExclusiveFullscreen)
+			o.logger.Info("A display is under exclusive fullscreen - no external window " +
+				"can be drawn over that one. Panels on the other monitors are unaffected")
 		} else {
 			o.logger.Debug("Exclusive fullscreen ended")
 		}

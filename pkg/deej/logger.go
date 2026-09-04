@@ -15,13 +15,15 @@ const (
 	buildTypeDev     = "dev"
 	buildTypeRelease = "release"
 
-	logDirectory = "logs"
-	logFilename  = "deej-latest-run.log"
+	logDirectory     = "logs"
+	logFilename      = "deej-latest-run.log"
+	crashLogFilename = "deej-crash.log"
 )
 
 // NewLogger provides a logger instance for the whole program
 func NewLogger(buildType string) (*zap.SugaredLogger, error) {
 	var loggerConfig zap.Config
+	var stderrErr error
 
 	// release: info and above, log to file only (no UI)
 	if buildType == buildTypeRelease {
@@ -33,6 +35,10 @@ func NewLogger(buildType string) (*zap.SugaredLogger, error) {
 
 		loggerConfig.OutputPaths = []string{filepath.Join(logDirectory, logFilename)}
 		loggerConfig.Encoding = "console"
+
+		// a release build has no console, so a panic would otherwise be swallowed
+		// whole. this is the only way a crash ever becomes visible
+		stderrErr = redirectStderrToFile(filepath.Join(logDirectory, crashLogFilename))
 
 		// development: debug and above, log to stderr only, colorful
 	} else {
@@ -59,6 +65,10 @@ func NewLogger(buildType string) (*zap.SugaredLogger, error) {
 
 	// no reason not to use the sugared logger - it's fast enough for anything we're gonna do
 	sugar := logger.Sugar()
+
+	if stderrErr != nil {
+		sugar.Warnw("Failed to capture crash output to file", "error", stderrErr)
+	}
 
 	return sugar, nil
 }

@@ -2,6 +2,7 @@ package deej
 
 import (
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -113,6 +114,15 @@ func (d *Deej) showSliderOSD(entry OSDEntry) {
 	if d.osdSuppressed() {
 		return
 	}
+
+	// the overlay must never be able to take deej down with it - volume control is
+	// the job that actually matters, and it runs on this same goroutine
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			d.logger.Errorw("Recovered from a panic while showing the overlay",
+				"panic", recovered, "stack", string(debug.Stack()))
+		}
+	}()
 
 	d.osd.ShowEntry(entry)
 }

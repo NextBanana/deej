@@ -94,6 +94,17 @@ var osdEnumMonitorsCallback = syscall.NewCallback(osdEnumMonitorsProc)
 // touched from the ui thread, so it needs no locking
 var osdEnumMonitorsResult []win.RECT
 
+// The message buffer deliberately lives in package scope rather than on the ui
+// goroutine's stack. GetMessage and DispatchMessage hold a raw pointer to it while
+// the window procedure runs, and that procedure is ordinary go code: painting,
+// map lookups, allocations. Any of it can grow the goroutine's stack, which moves
+// the stack to a new address and releases the old one for another goroutine to
+// reuse. Windows, holding the old address, would then write an incoming message
+// straight into unrelated memory. A package level variable lives in static
+// storage - its address is fixed for the life of the process and is never handed
+// to anything else. Only the ui thread ever touches it, so it needs no locking
+var osdMessage win.MSG
+
 type osdEntryState struct {
 	entry     OSDEntry
 	expiresAt time.Time
@@ -262,10 +273,9 @@ func (o *WindowsOSD) uiThread(ready chan error) {
 	ready <- nil
 	o.logger.Debug("Overlay window ready")
 
-	var msg win.MSG
-	for win.GetMessage(&msg, 0, 0, 0) > 0 {
-		win.TranslateMessage(&msg)
-		win.DispatchMessage(&msg)
+	for win.GetMessage(&osdMessage, 0, 0, 0) > 0 {
+		win.TranslateMessage(&osdMessage)
+		win.DispatchMessage(&osdMessage)
 	}
 
 	o.releaseResources()

@@ -18,6 +18,11 @@ const (
 	logDirectory     = "logs"
 	logFilename      = "deej-latest-run.log"
 	crashLogFilename = "deej-crash.log"
+
+	// temporary diagnostic aid. deej only writes to the log when a slider is moved,
+	// so a crash can't be located in time at all - the log simply stops somewhere
+	// after the last interaction. remove this once the crash is understood
+	heartbeatInterval = time.Minute * 5
 )
 
 // NewLogger provides a logger instance for the whole program
@@ -70,5 +75,25 @@ func NewLogger(buildType string) (*zap.SugaredLogger, error) {
 		sugar.Warnw("Failed to capture crash output to file", "error", stderrErr)
 	}
 
+	startHeartbeat(sugar)
+
 	return sugar, nil
+}
+
+// startHeartbeat writes a marker at a fixed interval. It answers three questions a
+// crash otherwise leaves open: when the process actually died, whether it died
+// while idle or in the middle of something, and - if the crash log stays empty
+// while these markers stop - whether it was terminated from outside rather than
+// crashing on its own
+func startHeartbeat(logger *zap.SugaredLogger) {
+	go func() {
+		started := time.Now()
+
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			logger.Infow("Still alive", "uptime", time.Since(started).Round(time.Second).String())
+		}
+	}()
 }
